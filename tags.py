@@ -1,47 +1,53 @@
 import boto3
 import os
+import logging
 
-def assume_role(account_id, role_name="OrganizationAccountAccessRole"):
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+def assume_role(account_id, role_name="AWSReservedSSO_AWSOrganizationFullAccess"):
     sts_client = boto3.client('sts')
     role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
     
-    assumed_role = sts_client.assume_role(
-        RoleArn=role_arn,
-        RoleSessionName="CrossAccountSession"
-    )
-    
-    credentials = assumed_role['Credentials']
-    return boto3.Session(
-        aws_access_key_id=credentials['AccessKeyId'],
-        aws_secret_access_key=credentials['SecretAccessKey'],
-        aws_session_token=credentials['SessionToken'],
-    )
+    try:
+        assumed_role = sts_client.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="CrossAccountSession",
+            DurationSeconds=3600  # Optional: specify session duration
+        )
+        credentials = assumed_role['Credentials']
+        return boto3.Session(
+            aws_access_key_id=credentials['AccessKeyId'],
+            aws_secret_access_key=credentials['SecretAccessKey'],
+            aws_session_token=credentials['SessionToken'],
+        )
+    except Exception as e:
+        logger.error(f"Failed to assume role for account {account_id}: {str(e)}")
+        return None
 
 def get_all_accounts():
     org_client = boto3.client('organizations')
     paginator = org_client.get_paginator('list_accounts')
-    accounts = []
-    for page in paginator.paginate():
-        accounts.extend(page['Accounts'])
+    accounts = [account for page in paginator.paginate() for account in page['Accounts']]
     return accounts
 
-def check_ec2_instances(session):
+def get_untagged_ec2_instances(session):
     ec2_client = session.client('ec2')
     instances = ec2_client.describe_instances()
-    untagged_resources = []
+    untagged_instances = [
+        instance['InstanceId']
+        for reservation in instances['Reservations']
+        for instance in reservation['Instances']
+        if 'map-migrated' not in {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])} or
+           'map-dba' not in {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+    ]
+    return untagged_instances
 
-    for reservation in instances['Reservations']:
-        for instance in reservation['Instances']:
-            tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
-            if 'map-migrated' not in tags or 'map-dba' not in tags:
-                untagged_resources.append(instance['InstanceId'])
-
-    return untagged_resources
-
-def check_s3_buckets(session):
+def get_untagged_s3_buckets(session):
     s3_client = session.client('s3')
     buckets = s3_client.list_buckets()['Buckets']
-    untagged_resources = []
+    untagged_buckets = []
 
     for bucket in buckets:
         bucket_name = bucket['Name']
@@ -51,30 +57,26 @@ def check_s3_buckets(session):
             tags = []
         tag_keys = {tag['Key'] for tag in tags}
         if 'map-migrated' not in tag_keys or 'map-dba' not in tag_keys:
-            untagged_resources.append(bucket_name)
+            untagged_buckets.append(bucket_name)
 
-    return untagged_resources
+    return untagged_buckets
 
-def check_rds_instances(session):
+def get_untagged_rds_instances(session):
     rds_client = session.client('rds')
-    instances = rds_client.describe_db_instances()
-    untagged_resources = []
-
-    for instance in instances['DBInstances']:
-        resource_arn = instance['DBInstanceArn']
-        tags = rds_client.list_tags_for_resource(ResourceName=resource_arn).get('TagList', [])
-        tag_keys = {tag['Key'] for tag in tags}
-        if 'map-migrated' not in tag_keys or 'map-dba' not in tag_keys:
-            untagged_resources.append(instance['DBInstanceIdentifier'])
-
-    return untagged_resources
+    instances = rds_client.describe_db_instances()['DBInstances']
+    untagged_instances = [
+        instance['DBInstanceIdentifier']
+        for instance in instances
+        if 'map-migrated' not in {tag['Key'] for tag in rds_client.list_tags_for_resource(ResourceName=instance['DBInstanceArn']).get('TagList', [])} or
+           'map-dba' not in {tag['Key'] for tag in rds_client.list_tags_for_resource(ResourceName=instance['DBInstanceArn']).get('TagList', [])}
+    ]
+    return untagged_instances
 
 def check_resources(session):
     return {
-        'ec2_instances': check_ec2_instances(session),
-        's3_buckets': check_s3_buckets(session),
-        'rds_instances': check_rds_instances(session),
-        #'lambda_functions': check_lambda_functions(session)
+        'ec2_instances': get_untagged_ec2_instances(session),
+        's3_buckets': get_untagged_s3_buckets(session),
+        'rds_instances': get_untagged_rds_instances(session),
     }
 
 def lambda_handler(event, context):
@@ -84,16 +86,20 @@ def lambda_handler(event, context):
     for account in accounts:
         account_id = account['Id']
         account_name = account['Name']
+        logger.info(f"Checking account {account_name} ({account_id})")
+        
+        session = assume_role(account_id)
+        if session is None:
+            continue
+        
         try:
-            session = assume_role(account_id)
             untagged_resources = check_resources(session)
             if any(untagged_resources.values()):
                 untagged_resources_report[account_name] = untagged_resources
         except Exception as e:
-            print(f"Error accessing account {account_name} ({account_id}): {str(e)}")
+            logger.error(f"Error checking resources in account {account_name} ({account_id}): {str(e)}")
     
-    # Output the report, send it via SNS or any preferred method
-    print("Untagged Resources Report:", untagged_resources_report)
+    logger.info("Untagged Resources Report: %s", untagged_resources_report)
 
     sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
     if sns_topic_arn:
