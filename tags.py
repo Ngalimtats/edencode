@@ -31,27 +31,32 @@ def lambda_handler(event, context):
         csv_file = write_report_to_csv(untagged_resources_report)
         s3_bucket = os.environ.get('S3_BUCKET')
         if s3_bucket:
-            upload_file_to_s3(csv_file, s3_bucket, 'untagged_resource_report.csv')
+            s3_object_name = 'untagged_resource_report.csv'
+            upload_file_to_s3(csv_file, s3_bucket, s3_object_name)
+            s3_url = f"https://{s3_bucket}.s3.amazonaws.com/{s3_object_name}"
 
-        final_report = f"The following resources have been found not tagged with pps mandatory tags; map-migrated or map-dba:\n"
-        final_report += f"Account ID: {untagged_resources_report['AccountID']}, Account Name: {untagged_resources_report['AccountName']}\n"
-        for resource in untagged_resources_report['Resources']:
-            final_report += f"ResourceARN : {resource['ResourceARN']}, Tags : {resource['Tags']}\n"
-        logger.info("Untagged Resources Report : %s", final_report)
-    
-        notification_message = f"Untagged Resources Report: The Following resources have been found not tagged with any of the pps mandatory tags;  map-migrated and map-dba: {untagged_resources_report}. PLEASE TAKE ACTIONS ACCORDINGLY !!!"
-        sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
-        if sns_topic_arn:
-            sns_client = boto3.client('sns')
-            sns_client.publish(
-                TopicArn=sns_topic_arn,
-                Message=notification_message,
-                Subject="Untagged Resources Report"
+            final_report = f"The following resources have been found not tagged with pps mandatory tags; map-migrated or map-dba:\n"
+            final_report += f"Account ID: {untagged_resources_report['AccountID']}, Account Name: {untagged_resources_report['AccountName']}\n"
+            for resource in untagged_resources_report['Resources']:
+                final_report += f"ResourceARN : {resource['ResourceARN']}, Tags : {resource['Tags']}, Created By: {resource['CreatedBy']}\n"
+            logger.info("Untagged Resources Report : %s", final_report)
+
+            notification_message = (
+                f"Untagged Resources Report: The Following resources have been found not tagged with any of the pps mandatory tags; "
+                f"map-migrated and map-dba: {untagged_resources_report}. PLEASE TAKE ACTIONS ACCORDINGLY !!!\n\n"
+                f"Report CSV file: {s3_url}"
             )
+            sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+            if sns_topic_arn:
+                sns_client = boto3.client('sns')
+                sns_client.publish(
+                    TopicArn=sns_topic_arn,
+                    Message=notification_message,
+                    Subject="Untagged Resources Report"
+                )
 
     logger.info("Untagged Resources Report: %s", untagged_resources_report)
     return untagged_resources_report
-
 
 # def assume_role(account_id, role_name ="OrganizationalAccountAccessRole"):
 #     sts_client = boto3.client('sts')
@@ -90,20 +95,32 @@ def get_untagged_resources(session, required_tags):
             tags = {tag['Key']: tag['Value'] for tag in resource.get('Tags', [])}
             resource_arn = resource['ResourceARN']
             if not all(tag in tags for tag in required_tags):
+                created_by = determine_creation_source(tags)
                 resource_report = {
                     'ResourceARN': resource_arn,
                     'Tags': {
                         'Name': tags.get('name', 'Not Tagged'),
                         'map-migrated': tags.get('map-migrated', 'Not Tagged'),
                         'map-dba': tags.get('map-dba', 'Not Tagged')
-                    }
+                    },
+                    'CreatedBy': created_by
                 }
                 untagged_resources.append(resource_report)
     return untagged_resources
 
+def determine_creation_source(tags):
+    # Heuristic to determine the creation source
+    if 'terraform' in tags.values():
+        return 'Terraform'
+    if 'created-by' in tags and tags['created-by'] == 'terraform':
+        return 'Terraform'
+    if 'managed-by' in tags and tags['managed-by'] == 'terraform':
+        return 'Terraform'
+    return 'Console'
+
 def write_report_to_csv(report):
     with tempfile.NamedTemporaryFile(mode='w', newline='', delete=False) as csvfile:
-        fieldnames = ['AccountID', 'AccountName', 'ResourceARN', 'Name', 'map-migrated', 'map-dba']
+        fieldnames = ['AccountID', 'AccountName', 'ResourceARN', 'Name', 'map-migrated', 'map-dba', 'CreatedBy']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
@@ -114,7 +131,8 @@ def write_report_to_csv(report):
                 'ResourceARN': resource['ResourceARN'],
                 'Name': resource['Tags']['Name'],
                 'map-migrated': resource['Tags']['map-migrated'],
-                'map-dba': resource['Tags']['map-dba']
+                'map-dba': resource['Tags']['map-dba'],
+                'CreatedBy': resource['CreatedBy']
             })
         return csvfile.name
     
@@ -137,6 +155,7 @@ def get_account_name(account_id):
     except Exception as e:
         logger.error(f"Error describing account {account_id}: {str(e)}")
         return "Unknown Account Name"
+
 
 
 
