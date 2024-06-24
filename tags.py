@@ -1,4 +1,3 @@
-#Using AWS Resource Groups
 import boto3
 import os
 import logging
@@ -20,41 +19,39 @@ def lambda_handler(event, context):
     try:
         untagged_resources = get_untagged_resources(session, required_tags)
         untagged_resources_report = {
-            'AcountID': account_id,
+            'AccountID': account_id,
             'AccountName': account_name,
-            'Resources' : untagged_resources
+            'Resources': untagged_resources
         } if untagged_resources else {}
     except Exception as e:
         logger.error(f"Error checking resources in account {account_name} ({account_id}): {str(e)}")
+        return {"error": f"Error checking resources in account {account_name} ({account_id}): {str(e)}"}
 
-    # if untagged_resources_report:
-    #     csv_file = write_report_to_csv(untagged_resources_report)
-    #     s3_bucket = os.environ.get('S3_BUCKET')
-    #     if s3_bucket:
-    #         upload_file_to_s3(csv_file, s3_bucket, 'untagged_resource_report.csv')
+    if untagged_resources_report:
+        csv_file = write_report_to_csv(untagged_resources_report)
+        s3_bucket = os.environ.get('S3_BUCKET')
+        if s3_bucket:
+            upload_file_to_s3(csv_file, s3_bucket, 'untagged_resource_report.csv')
 
-    # final_report = "The following resources have been fount not tagged with pps mandatory tags; map-migrated or map-dba:\n"
-    # for account_report in untagged_resources_report:
-    #     final_report += f"Account ID: {account_report['AccountID']}, Account Name: {account_report['AccountName']}\n"
-    #     for resource in account_report['Resources']:
-    #         final_report += f"ResourceARN : {resource['ResourceARN']}, Tags : {resource['Tags']}\n"
-    # logger.info("Untagged Resources Report : %s", final_report)
-
-        return{"error": f"Error checking resources in account {account_name} ({account_id}): {str(e)}"}
+        final_report = f"The following resources have been found not tagged with pps mandatory tags; map-migrated or map-dba:\n"
+        final_report += f"Account ID: {untagged_resources_report['AccountID']}, Account Name: {untagged_resources_report['AccountName']}\n"
+        for resource in untagged_resources_report['Resources']:
+            final_report += f"ResourceARN : {resource['ResourceARN']}, Tags : {resource['Tags']}\n"
+        logger.info("Untagged Resources Report : %s", final_report)
     
+        notification_message = f"Untagged Resources Report: The Following resources have been found not tagged with any of the pps mandatory tags;  map-migrated and map-dba: {untagged_resources_report}. PLEASE TAKE ACTIONS ACCORDINGLY !!!"
+        sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+        if sns_topic_arn:
+            sns_client = boto3.client('sns')
+            sns_client.publish(
+                TopicArn=sns_topic_arn,
+                Message=notification_message,
+                Subject="Untagged Resources Report"
+            )
+
     logger.info("Untagged Resources Report: %s", untagged_resources_report)
-
-    notification_message = f"Untagged Resources Report: The Following resources have been found not tagged with any of the pps mandatory tags;  map-migrated and map-dba: {untagged_resources_report}. PLEASE TAKE ACTIONS ACCORDINGLY !!!"
-    sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
-    if sns_topic_arn and untagged_resources_report:
-        sns_client = boto3.client('sns')
-        sns_client.publish(
-            TopicArn=sns_topic_arn,
-            Message=notification_message,
-            Subject="Untagged Resources Report"
-        )
-    
     return untagged_resources_report
+
 
 # def assume_role(account_id, role_name ="OrganizationalAccountAccessRole"):
 #     sts_client = boto3.client('sts')
@@ -83,15 +80,14 @@ def lambda_handler(event, context):
 #     return accounts
 
 
-
 def get_untagged_resources(session, required_tags):
     tagging_client = session.client('resourcegroupstaggingapi')
     paginator = tagging_client.get_paginator('get_resources')
-    untagged_resources =[]
+    untagged_resources = []
 
     for page in paginator.paginate(ResourcesPerPage=100):
         for resource in page['ResourceTagMappingList']:
-            tags = {tag['Key']: tag['Value'] for tag in resource.get ('Tags',[])}
+            tags = {tag['Key']: tag['Value'] for tag in resource.get('Tags', [])}
             resource_arn = resource['ResourceARN']
             if not all(tag in tags for tag in required_tags):
                 resource_report = {
@@ -105,35 +101,33 @@ def get_untagged_resources(session, required_tags):
                 untagged_resources.append(resource_report)
     return untagged_resources
 
-
 def write_report_to_csv(report):
     with tempfile.NamedTemporaryFile(mode='w', newline='', delete=False) as csvfile:
         fieldnames = ['AccountID', 'AccountName', 'ResourceARN', 'Name', 'map-migrated', 'map-dba']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
 
-        for account_report in report:
-            for resources in account_report['Resources']:
-                writer.writerow({
-                    'AccountId': account_report['AccountID'],
-                    'AccountName': account_report['AccountName'],
-                    'ResourceARN': resource['ResourceARN'],
-                    'Name': resource['Tags']['Name'],
-                    'map-migrated': resource['Tags']['map-migrated'],
-                    'map-dba': resource['Tags']['map-dba']
-                })
+        for resource in report['Resources']:
+            writer.writerow({
+                'AccountID': report['AccountID'],
+                'AccountName': report['AccountName'],
+                'ResourceARN': resource['ResourceARN'],
+                'Name': resource['Tags']['Name'],
+                'map-migrated': resource['Tags']['map-migrated'],
+                'map-dba': resource['Tags']['map-dba']
+            })
         return csvfile.name
     
 def upload_file_to_s3(file_name, bucket, object_name=None):
     if object_name is None:
         object_name = os.path.basename(file_name)
-        
-        s3_client = boto3.client('s3')
-        try:
-            s3_client.upload_file(file_name, bucket, object_name)
-            logger.info(f"File uploaded to s3: s3://{bucket}/{object_name}")
-        except Exception as e:
-            logger.error(f"Failed to upload file to s3: {str(e)}")
+    
+    s3_client = boto3.client('s3')
+    try:
+        s3_client.upload_file(file_name, bucket, object_name)
+        logger.info(f"File uploaded to s3: s3://{bucket}/{object_name}")
+    except Exception as e:
+        logger.error(f"Failed to upload file to s3: {str(e)}")
 
 def get_account_name(account_id):
     org_client = boto3.client('organizations')
@@ -143,6 +137,7 @@ def get_account_name(account_id):
     except Exception as e:
         logger.error(f"Error describing account {account_id}: {str(e)}")
         return "Unknown Account Name"
+
 
 
 
